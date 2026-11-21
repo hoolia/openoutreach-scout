@@ -249,3 +249,9 @@ A tag `v<version>` (the version in `pyproject.toml` and `src/oo_scout/__init__.p
 builds the image from `Containerfile` and pushes `ghcr.io/hoolia/openoutreach-scout:<version>`;
 the job summary shows the pushed digest. A tag is never pushed twice: an existing image
 version fails the job.
+
+When Actions cannot run, a maintainer runs the same two steps on an OpenShift cluster: the
+unit tests in a pod from the tagged source, then a one-off Docker-strategy `BuildConfig`
+from this repository at the tag (`dockerfilePath: Containerfile`, build argument
+`VERSION`) with output to the same image tag. Neither the tests nor the build run on a
+workstation. The release notes name the digest and say where the image was built.
