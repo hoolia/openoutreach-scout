@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned upstream linkedin_cli, checksum-verified
+        run: |
+          apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null
+          sh scripts/fetch-upstream.sh upstream
+      - name: Install from the hashed lock
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --require-hashes -r requirements.lock
+          /tmp/venv/bin/pip install --quiet --no-deps -e .
+          /tmp/venv/bin/pip install --quiet pytest==9.2.0 respx==0.23.1
+      - name: Unit tests
+        run: /tmp/venv/bin/python -m pytest -q
+      - name: The tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(/tmp/venv/bin/python -c 'import oo_scout; print(oo_scout.__version__)')
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match version $v"; exit 1; }
+
+  image:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/openoutreach-scout
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          load: true
+          build-args: VERSION=${{ steps.v.outputs.version }}
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.version }}
+          provenance: false
+      - name: "Smoke test: read-only defaults and the guard"
+        run: |
+          printf 'linkedin:\n  rules: []\n' > "$RUNNER_TEMP/playbook.yaml"
+          docker run --rm -v "$RUNNER_TEMP/playbook.yaml:/etc/oo-scout/playbook.yaml:ro" \
+            "$IMAGE:${{ steps.v.outputs.version }}" check-config | tee "$RUNNER_TEMP/config.json"
+          grep -q '"may_send": false' "$RUNNER_TEMP/config.json"
+          docker run --rm --entrypoint python "$IMAGE:${{ steps.v.outputs.version }}" -c '
+          from oo_scout import guard
+          guard.install()
+          import importlib
+          for mod, attr in guard.SEND_PATHS:
+              fn = getattr(importlib.import_module(mod), attr)
+              assert getattr(fn, "oo_scout_blocked", False), (mod, attr)
+          print("guard covers", len(guard.SEND_PATHS), "send paths")
+          '
+          docker run --rm --entrypoint ls "$IMAGE:${{ steps.v.outputs.version }}" /licenses
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite a released version
+        run: |
+          if output=$(docker manifest inspect "$IMAGE:${{ steps.v.outputs.version }}" 2>&1); then
+            echo "$IMAGE:${{ steps.v.outputs.version }} exists"; exit 1
+          elif [[ "$output" != *"manifest unknown"* && "$output" != *"no such manifest"* && "$output" != *"not found"* ]]; then
+            printf '%s\n' "$output" >&2; exit 1
+          fi
+      - name: Push
+        run: docker push "$IMAGE:${{ steps.v.outputs.version }}"
+      - name: Published digest
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE:${{ steps.v.outputs.version }}" --format '{{.Manifest.Digest}}')
+          printf '%s:%s@%s\n' "$IMAGE" "${{ steps.v.outputs.version }}" "$digest" | tee -a "$GITHUB_STEP_SUMMARY"
